@@ -34,6 +34,7 @@
 #include <fstream>
 #include <iostream>
 #include <ostream>
+#include <sstream>
 #include <vector>
 #include <set>
 #include <cstdlib>
@@ -690,13 +691,17 @@ static void PrintProcessStateMachineReadable(const ProcessState& process_state,
 //*** End of copy-paste from minidump_stackwalk.cc ***
 } // namespace
 
-extern "C" bool process_minidump(const char* minidump_path,
+extern "C" bool process_minidump(const char* minidump_contents,
+                                 int minidump_bytes,
                                  const char** symbol_path_array, int num_symbol_paths,
-                                 const char* json_path,
+                                 const char* input_json_contents,
+                                 int input_json_bytes,
                                  bool pretty, bool pipe,
                                  char** out_json, char** out_pipe)
 {
-  Minidump minidump(minidump_path);
+  std::istringstream dump_stream(string(minidump_contents, minidump_bytes));
+  Minidump minidump(dump_stream);
+
   vector<string> symbol_paths;
   symbol_paths.insert(symbol_paths.end(), symbol_path_array, symbol_path_array + num_symbol_paths);
 
@@ -723,9 +728,9 @@ extern "C" bool process_minidump(const char* minidump_path,
   }
 
   Json::Value raw_root(Json::objectValue);
-  if (json_path) {
+  if (input_json_contents) {
     Json::Reader reader;
-    ifstream raw_stream(json_path);
+    std::istringstream raw_stream(string(input_json_contents, input_json_bytes));
     reader.parse(raw_stream, raw_root);
   }
 

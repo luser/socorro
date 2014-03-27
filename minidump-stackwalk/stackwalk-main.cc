@@ -38,11 +38,14 @@
 
 using std::vector;
 
-extern "C" bool process_minidump(const char* minidump_path,
+extern "C" bool process_minidump(const char* minidump_contents,
+                                 int minidump_bytes,
                                  const char** symbol_path_array, int num_symbol_paths,
-                                 const char* json_path,
+                                 const char* input_json_contents,
+                                 int input_json_bytes,
                                  bool pretty, bool pipe,
                                  char** out_json, char** out_pipe);
+
 namespace {
 void usage() {
   fprintf(stderr, "Usage: stackwalker [options] <minidump> [<symbol paths]\n");
@@ -51,6 +54,21 @@ void usage() {
   fprintf(stderr, "\t--pipe-dump\tProduce pipe-delimited output in addition to JSON output\n");
   fprintf(stderr, "\t--raw-json\tAn input file with the raw annotations as JSON\n");
   fprintf(stderr, "\t--help\tDisplay this help text.\n");
+}
+
+bool read_file(const char* filename, vector<char>& contents) {
+  FILE* f = fopen(filename, "rb");
+  if (!f)
+    return false;
+
+  fseek(f, 0, SEEK_END);
+  off_t size = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  contents.resize(size);
+
+  bool res = fread(&contents[0], size, 1, f) == 1;
+  fclose(f);
+  return res;
 }
 
 } // namespace
@@ -101,13 +119,27 @@ int main(int argc, char** argv)
     return 1;
   }
 
+  vector<char> minidump_contents;
+  if (!read_file(argv[optind], minidump_contents)) {
+    return 1;
+  }
+
+  vector<char> json_contents;
+  if (json_path) {
+    if (!read_file(json_path, json_contents)) {
+      return 1;
+    }
+  }
+
   vector<const char*> symbol_paths;
   symbol_paths.insert(symbol_paths.end(), argv + optind + 1, argv + argc);
 
   char* out_json = nullptr;
   char* out_pipe = nullptr;
-  bool result = process_minidump(argv[optind], &symbol_paths[0], symbol_paths.size(),
-                                 json_path, pretty, pipe, &out_json, &out_pipe);
+  bool result = process_minidump(&minidump_contents[0], minidump_contents.size(),
+                                 &symbol_paths[0], symbol_paths.size(),
+                                 json_path ? &json_contents[0] : nullptr, json_contents.size(),
+                                 pretty, pipe, &out_json, &out_pipe);
   if (pipe && out_pipe) {
     printf("%s", out_pipe);
     printf("====PIPE DUMP ENDS===\n");
