@@ -10,8 +10,9 @@ JSON_SRCDIR := $(JSON_DIR)/src/lib_json
 JSON_INCLUDEDIR := $(JSON_DIR)/include
 
 BIN := stackwalker
+LIB := libstackwalk.so
 
-all: $(BIN)
+all: $(BIN) $(LIB)
 
 OBJS := \
   json_reader.o \
@@ -21,10 +22,13 @@ OBJS := \
 
 VPATH += $(JSON_SRCDIR)
 CXXFLAGS += -I$(JSON_INCLUDEDIR) -std=gnu++0x -Wno-format -Werror
+LDFLAGS += -Wl,-rpath='$$ORIGIN'
 
-$(BIN): $(BIN).cc $(BREAKPAD_LIBS) $(OBJS)
-	$(CXX) $(CXXFLAGS) -o $@ $< $(BREAKPAD_LIBS) $(OBJS) -I$(BREAKPAD_SRCDIR)
+$(BIN): stackwalk-main.cc $(OBJS) $(LIB)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $< -L. -lstackwalk
 
+$(LIB): stackwalker.cc $(BREAKPAD_LIBS)
+	$(CXX) $(CXXFLAGS) -o $@ -shared $< $(BREAKPAD_LIBS) $(OBJS) -I$(BREAKPAD_SRCDIR)
 
 clean:
-	$(RM) $(BIN) *.o
+	$(RM) $(BIN) $(LIB) *.o

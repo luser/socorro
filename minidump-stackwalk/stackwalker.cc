@@ -39,8 +39,8 @@
 #include <cstdlib>
 
 #include <errno.h>
-#include <getopt.h>
 #include <inttypes.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -141,6 +141,34 @@ private:
     }
   }
   std::set<const CodeModule*> loaded_modules_;
+};
+
+class stringbuffer {
+public:
+  stringbuffer() : buf(4096), current(0) {}
+  const char* get() const {
+    return &buf[0];
+  }
+
+  void printf(const char* fmt, ...) {
+    bool done = false;
+    do {
+      va_list args;
+      va_start(args, fmt);
+      int written = vsnprintf(&buf[current], buf.size() - current, fmt, args);
+      va_end(args);
+      if (current + written < buf.size()) {
+        current += written;
+        done = true;
+      } else {
+        buf.resize(buf.size() * 2);
+      }
+    } while(!done);
+  }
+
+private:
+  vector<char> buf;
+  size_t current;
 };
 
 string FrameTrust(StackFrame::FrameTrust trust) {
@@ -488,7 +516,8 @@ static string StripSeparator(const string &original) {
 // Module, function, source file, and source line may all be empty
 // depending on availability.  The code offset follows the same rules as
 // PrintStack above.
-static void PrintStackMachineReadable(int thread_num, const CallStack *stack) {
+static void PrintStackMachineReadable(int thread_num, const CallStack *stack,
+                                        stringbuffer& buf) {
   int frame_count = stack->frames()->size();
   // Does this stack need truncation?
   bool truncate = frame_count > kMaxThreadFrames;
@@ -504,20 +533,20 @@ static void PrintStackMachineReadable(int thread_num, const CallStack *stack) {
       continue;
 
     const StackFrame *frame = stack->frames()->at(frame_index);
-    printf("%d%c%d%c", thread_num, kOutputSeparator, frame_index,
+    buf.printf("%d%c%d%c", thread_num, kOutputSeparator, frame_index,
            kOutputSeparator);
 
     uint64_t instruction_address = frame->ReturnAddress();
 
     if (frame->module) {
       assert(!frame->module->code_file().empty());
-      printf("%s", StripSeparator(PathnameStripper::File(
+      buf.printf("%s", StripSeparator(PathnameStripper::File(
                      frame->module->code_file())).c_str());
       if (!frame->function_name.empty()) {
-        printf("%c%s", kOutputSeparator,
+        buf.printf("%c%s", kOutputSeparator,
                StripSeparator(frame->function_name).c_str());
         if (!frame->source_file_name.empty()) {
-          printf("%c%s%c%d%c0x%" PRIx64,
+          buf.printf("%c%s%c%d%c0x%" PRIx64,
                  kOutputSeparator,
                  StripSeparator(frame->source_file_name).c_str(),
                  kOutputSeparator,
@@ -525,14 +554,14 @@ static void PrintStackMachineReadable(int thread_num, const CallStack *stack) {
                  kOutputSeparator,
                  instruction_address - frame->source_line_base);
         } else {
-          printf("%c%c%c0x%" PRIx64,
+          buf.printf("%c%c%c0x%" PRIx64,
                  kOutputSeparator,  // empty source file
                  kOutputSeparator,  // empty source line
                  kOutputSeparator,
                  instruction_address - frame->function_base);
         }
       } else {
-        printf("%c%c%c%c0x%" PRIx64,
+        buf.printf("%c%c%c%c0x%" PRIx64,
                kOutputSeparator,  // empty function name
                kOutputSeparator,  // empty source file
                kOutputSeparator,  // empty source line
@@ -541,14 +570,14 @@ static void PrintStackMachineReadable(int thread_num, const CallStack *stack) {
       }
     } else {
       // the printf before this prints a trailing separator for module name
-      printf("%c%c%c%c0x%" PRIx64,
+      buf.printf("%c%c%c%c0x%" PRIx64,
              kOutputSeparator,  // empty function name
              kOutputSeparator,  // empty source file
              kOutputSeparator,  // empty source line
              kOutputSeparator,
              instruction_address);
     }
-    printf("\n");
+    buf.printf("\n");
   }
 }
 
@@ -557,7 +586,8 @@ static void PrintStackMachineReadable(int thread_num, const CallStack *stack) {
 // text format:
 // Module|{Module Filename}|{Version}|{Debug Filename}|{Debug Identifier}|
 // {Base Address}|{Max Address}|{Main}
-static void PrintModulesMachineReadable(const CodeModules *modules) {
+static void PrintModulesMachineReadable(const CodeModules *modules,
+                                        stringbuffer& buf) {
   if (!modules)
     return;
 
@@ -573,7 +603,7 @@ static void PrintModulesMachineReadable(const CodeModules *modules) {
        ++module_sequence) {
     const CodeModule *module = modules->GetModuleAtSequence(module_sequence);
     uint64_t base_address = module->base_address();
-    printf("Module%c%s%c%s%c%s%c%s%c0x%08" PRIx64 "%c0x%08" PRIx64 "%c%d\n",
+    buf.printf("Module%c%s%c%s%c%s%c%s%c0x%08" PRIx64 "%c0x%08" PRIx64 "%c%d\n",
            kOutputSeparator,
            StripSeparator(PathnameStripper::File(module->code_file())).c_str(),
            kOutputSeparator, StripSeparator(module->version()).c_str(),
@@ -588,59 +618,61 @@ static void PrintModulesMachineReadable(const CodeModules *modules) {
   }
 }
 
-static void PrintProcessStateMachineReadable(const ProcessState& process_state)
+static void PrintProcessStateMachineReadable(const ProcessState& process_state,
+                                             stringbuffer& buf)
 {
   // Print OS and CPU information.
   // OS|{OS Name}|{OS Version}
   // CPU|{CPU Name}|{CPU Info}|{Number of CPUs}
-  printf("OS%c%s%c%s\n", kOutputSeparator,
-         StripSeparator(process_state.system_info()->os).c_str(),
-         kOutputSeparator,
-         StripSeparator(process_state.system_info()->os_version).c_str());
-  printf("CPU%c%s%c%s%c%d\n", kOutputSeparator,
-         StripSeparator(process_state.system_info()->cpu).c_str(),
-         kOutputSeparator,
-         // this may be empty
-         StripSeparator(process_state.system_info()->cpu_info).c_str(),
-         kOutputSeparator,
-         process_state.system_info()->cpu_count);
+  buf.printf("OS%c%s%c%s\n", kOutputSeparator,
+             StripSeparator(process_state.system_info()->os).c_str(),
+             kOutputSeparator,
+             StripSeparator(process_state.system_info()->os_version).c_str());
+  buf.printf("CPU%c%s%c%s%c%d\n", kOutputSeparator,
+             StripSeparator(process_state.system_info()->cpu).c_str(),
+             kOutputSeparator,
+             // this may be empty
+             StripSeparator(process_state.system_info()->cpu_info).c_str(),
+             kOutputSeparator,
+             process_state.system_info()->cpu_count);
 
   int requesting_thread = process_state.requesting_thread();
 
   // Print crash information.
   // Crash|{Crash Reason}|{Crash Address}|{Crashed Thread}
-  printf("Crash%c", kOutputSeparator);
+  buf.printf("Crash%c", kOutputSeparator);
   if (process_state.crashed()) {
-    printf("%s%c0x%" PRIx64 "%c",
-           StripSeparator(process_state.crash_reason()).c_str(),
-           kOutputSeparator, process_state.crash_address(), kOutputSeparator);
+    buf.printf("%s%c0x%" PRIx64 "%c",
+               StripSeparator(process_state.crash_reason()).c_str(),
+               kOutputSeparator, process_state.crash_address(), kOutputSeparator);
   } else {
     // print assertion info, if available, in place of crash reason,
     // instead of the unhelpful "No crash"
     string assertion = process_state.assertion();
     if (!assertion.empty()) {
-      printf("%s%c%c", StripSeparator(assertion).c_str(),
-             kOutputSeparator, kOutputSeparator);
+      buf.printf("%s%c%c", StripSeparator(assertion).c_str(),
+                 kOutputSeparator, kOutputSeparator);
     } else {
-      printf("No crash%c%c", kOutputSeparator, kOutputSeparator);
+      buf.printf("No crash%c%c", kOutputSeparator, kOutputSeparator);
     }
   }
 
   if (requesting_thread != -1) {
-    printf("%d\n", requesting_thread);
+    buf.printf("%d\n", requesting_thread);
   } else {
-    printf("\n");
+    buf.printf("\n");
   }
 
-  PrintModulesMachineReadable(process_state.modules());
+  PrintModulesMachineReadable(process_state.modules(), buf);
 
   // blank line to indicate start of threads
-  printf("\n");
+  buf.printf("\n");
 
   // If the thread that requested the dump is known, print it first.
   if (requesting_thread != -1) {
     PrintStackMachineReadable(requesting_thread,
-                              process_state.threads()->at(requesting_thread));
+                              process_state.threads()->at(requesting_thread),
+                              buf);
   }
 
   // Print all of the threads in the dump.
@@ -649,76 +681,24 @@ static void PrintProcessStateMachineReadable(const ProcessState& process_state)
     if (thread_index != requesting_thread) {
       // Don't print the crash thread again, it was already printed.
       PrintStackMachineReadable(thread_index,
-                                process_state.threads()->at(thread_index));
+                                process_state.threads()->at(thread_index),
+                                buf);
     }
   }
 }
 
 //*** End of copy-paste from minidump_stackwalk.cc ***
-
-void usage() {
-  fprintf(stderr, "Usage: stackwalker [options] <minidump> [<symbol paths]\n");
-  fprintf(stderr, "Options:\n");
-  fprintf(stderr, "\t--pretty\tPretty-print JSON output.\n");
-  fprintf(stderr, "\t--pipe-dump\tProduce pipe-delimited output in addition to JSON output\n");
-  fprintf(stderr, "\t--raw-json\tAn input file with the raw annotations as JSON\n");
-  fprintf(stderr, "\t--help\tDisplay this help text.\n");
-}
-
 } // namespace
-int main(int argc, char** argv)
+
+extern "C" bool process_minidump(const char* minidump_path,
+                                 const char** symbol_path_array, int num_symbol_paths,
+                                 const char* json_path,
+                                 bool pretty, bool pipe,
+                                 char** out_json, char** out_pipe)
 {
-  bool pretty = false;
-  bool pipe = false;
-  char* json_path = nullptr;
-  static struct option long_options[] = {
-    {"pretty", no_argument, nullptr, 'p'},
-    {"pipe-dump", no_argument, nullptr, 'i'},
-    {"raw-json", required_argument, nullptr, 'r'},
-    {"help", no_argument, nullptr, 'h'},
-    {nullptr, 0, nullptr, 0}
-  };
-  int arg;
-  int option_index = 0;
-  while((arg = getopt_long(argc, argv, "", long_options, &option_index))
-        != -1) {
-    switch(arg) {
-    case 0:
-      if (long_options[option_index].flag != 0)
-          break;
-      break;
-    case 'p':
-      pretty = true;
-      break;
-    case 'i':
-      pipe = true;
-      break;
-    case 'r':
-      json_path = optarg;
-      break;
-    case 'h':
-      usage();
-      return 0;
-    case '?':
-      break;
-    default:
-      fprintf(stderr, "Unknown option: -%c\n", (char)arg);
-      usage();
-      return 1;
-    }
-  }
-
-  if (optind >= argc) {
-    usage();
-    return 1;
-  }
-
-  Minidump minidump(argv[optind]);
+  Minidump minidump(minidump_path);
   vector<string> symbol_paths;
-  // allow symbol paths to be passed on the commandline.
-  for (int i = optind + 1; i < argc; i++) {
-    symbol_paths.push_back(argv[i]);
-  }
+  symbol_paths.insert(symbol_paths.end(), symbol_path_array, symbol_path_array + num_symbol_paths);
 
   minidump.Read();
   // process minidump
@@ -736,9 +716,10 @@ int main(int argc, char** argv)
 
   if (pipe) {
     if (result == google_breakpad::PROCESS_OK) {
-      PrintProcessStateMachineReadable(process_state);
+      stringbuffer buf;
+      PrintProcessStateMachineReadable(process_state, buf);
+      *out_pipe = strdup(buf.get());
     }
-    printf("====PIPE DUMP ENDS===\n");
   }
 
   Json::Value raw_root(Json::objectValue);
@@ -759,8 +740,9 @@ int main(int argc, char** argv)
     writer = new Json::StyledWriter();
   else
     writer = new Json::FastWriter();
-  printf("%s\n", writer->write(root).c_str());
+  string json_string = writer->write(root);
+  *out_json = strdup(json_string.c_str());
 
   delete writer;
-  return 0;
+  return result == google_breakpad::PROCESS_OK;
 }

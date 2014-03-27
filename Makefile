@@ -119,4 +119,4 @@ stackwalker:
 	# Build JSON stackwalker
 	# Depends on breakpad, run "make breakpad" if you don't have it yet
 	cd minidump-stackwalk; make
-	cp minidump-stackwalk/stackwalker stackwalk/bin
+	cp minidump-stackwalk/stackwalker minidump-stackwalk/libstackwalk.so stackwalk/bin
