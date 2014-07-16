@@ -184,6 +184,12 @@ class HybridCrashProcessor(RequiredConfig):
         doc='boolean indictating if we are using the old monitor_app.py',
         default=False,
     )
+    required_config.add_option(
+        'expect_pipe_dump',
+        doc='boolean indictating if stackwalker is outputting a pipe dump '
+        'along with the JSON dump',
+        default=True,
+    )
     required_config.namespace('statistics')
     required_config.statistics.add_option(
         'stats_class',
@@ -280,6 +286,7 @@ class HybridCrashProcessor(RequiredConfig):
             config.java_signature.java_signature_tool_class(
                 config.java_signature
             )
+        self._expect_pipe_dump = config.expect_pipe_dump
         self._product_id_map = {}
         self._load_product_id_map()
         self._statistics = config.statistics.stats_class(
@@ -880,6 +887,81 @@ class HybridCrashProcessor(RequiredConfig):
         return '\n'.join(pipedump_lines) + '\n'
 
     #--------------------------------------------------------------------------
+    def _stackwalk_json_analysis(
+        self,
+        json_dump,
+        is_hang,
+        java_stack_trace,
+        submitted_timestamp,
+        processor_notes
+    ):
+        processed_crash_update = DotDict()
+        processed_crash_update.os_name = self._get_recursive_truncate_or_none(json_dump, ('system_info', 'os'), 100)
+        processed_crash_update.os_version = self._get_recursive_truncate_or_none(json_dump, ('system_info', 'os_ver'), 100)
+        processed_crash_update.cpu_name = self._get_recursive_truncate_or_none(json_dump, ('system_info', 'cpu_arch'), 100)
+        processed_crash_update.cpu_info = self._get_recursive_truncate_or_none(json_dump, ('system_info', 'cpu_info'), 100)
+        cpu_count = self._get_recursive_or_default(json_dump, ('system_info', 'cpu_count'))
+        if cpu_count is not None:
+            processed_crash_update.cpu_info = ('%s | %s' % (
+                processed_crash_update.cpu_info,
+                cpu_count
+            ))
+        try:
+            make_modules_lowercase = \
+                processed_crash_update.os_name in ('Windows NT')
+        except (KeyError, TypeError):
+            make_modules_lowercase = True
+
+        processed_crash_update.reason = \
+            self._get_recursive_truncate_or_none(json_dump, ('crash_info', 'type'), 255)
+        processed_crash_update.address = \
+            self._get_recursive_truncate_or_none(json_dump, ('crash_info', 'address'), 20)
+        crashed_thread = self._get_recursive_or_default(json_dump, ('crash_info', 'crashing_thread'))
+        if crashed_thread is None:
+            processor_notes.append('MDSW did not identify the crashing thread')
+        processed_crash_update.crashedThread = crashed_thread
+        flash_version = None
+        if 'modules' in json_dump:
+            for module in json_dump['modules']:
+                flash_version = \
+                    self._get_flash_version(json_dump['modules'])
+                if flash_version:
+                    break
+        if not flash_version:
+            flash_version = '[blank]'
+        processed_crash_update.flash_version = flash_version
+
+        processed_crash_update.exploitability = \
+                self._get_recursive_or_default(json_dump, ('sensitive', 'exploitability'), default='unknown')
+        if processed_crash_update.exploitability == 'unknown':
+            processor_notes.append("exploitablity information missing")
+
+        processed_crash_update.truncated = \
+                self._get_recursive_or_default(
+                    json_dump,
+                    ('crashing_thread', 'frames_truncated'),
+                    default=False
+                )
+
+        signature_thread = 0 if is_hang == 1 else crashed_thread
+        if (signature_thread and
+            signature_thread < len(json_dump['threads'])
+        ):
+            processed_crash_from_signature_thread = self._analyze_frames(
+                json_dump['threads'][signature_thread],
+                is_hang,
+                java_stack_trace,
+                make_modules_lowercase,
+                crashed_thread,
+                submitted_timestamp,
+                processor_notes
+            )
+            processed_crash_update.update(
+                processed_crash_from_signature_thread
+            )
+        return processed_crash_update
+
+    #--------------------------------------------------------------------------
     def _stackwalk_analysis(
         self,
         dump_analysis_line_iterator,
@@ -892,31 +974,13 @@ class HybridCrashProcessor(RequiredConfig):
     ):
         with closing(dump_analysis_line_iterator) as mdsw_iter:
             self.quit_check()
-            processed_crash_update = self._analyze_header(
-                crash_id,
-                mdsw_iter,
-                submitted_timestamp,
-                processor_notes
-            )
-            crashed_thread = processed_crash_update.crashedThread
-            try:
-                make_modules_lowercase = \
-                    processed_crash_update.os_name in ('Windows NT')
-            except (KeyError, TypeError):
-                make_modules_lowercase = True
-            self.quit_check()
-            processed_crash_from_frames = self._analyze_frames(
-                is_hang,
-                java_stack_trace,
-                make_modules_lowercase,
-                mdsw_iter,
-                submitted_timestamp,
-                crashed_thread,
-                processor_notes
-            )
-            processed_crash_update.update(processed_crash_from_frames)
 
+            if self._expect_pipe_dump:
+                for line in mdsw_iter:
+                    if '====PIPE DUMP ENDS===' in line:
+                        break
             self.quit_check()
+
             try:
                 mdsw_iter.cache.remove("====PIPE DUMP ENDS===")
             except ValueError:
@@ -926,14 +990,20 @@ class HybridCrashProcessor(RequiredConfig):
             ):
                 # we've gone too far and consumed the jDump - get it back
                 json_dump_lines = [mdsw_iter.cache[-1]]
-                pipe_dump_str = self._create_pipe_dump_entry(
-                    mdsw_iter.cache[:-1]
-                )
+                if self._expect_pipe_dump:
+                    pipe_dump_str = self._create_pipe_dump_entry(
+                        mdsw_iter.cache[:-1]
+                    )
             else:
-                pipe_dump_str = self._create_pipe_dump_entry(mdsw_iter.cache)
+                if self._expect_pipe_dump:
+                    pipe_dump_str = self._create_pipe_dump_entry(
+                        mdsw_iter.cache
+                    )
                 json_dump_lines = []
 
-            processed_crash_update.dump = pipe_dump_str
+            processed_crash_update = DotDict()
+            if self._expect_pipe_dump:
+                processed_crash_update.dump = pipe_dump_str
 
             for x in mdsw_iter:
                 json_dump_lines.append(x)
@@ -943,23 +1013,25 @@ class HybridCrashProcessor(RequiredConfig):
             except ValueError, x:
                 processed_crash_update.json_dump = {}
                 processor_notes.append("no json output found from MDSW")
+                return processed_crash_update
 
-            try:
-                processed_crash_update.exploitability = (
-                    processed_crash_update.json_dump
-                    ['sensitive']['exploitability']
-                )
-            except KeyError:
-                processed_crash_update.exploitability = 'unknown'
-                processor_notes.append("exploitablity information missing")
+            json_dump = processed_crash_update.json_dump
+            if 'status' in json_dump and json_dump['status'] == 'OK':
+                processed_crash_update_from_json = \
+                    self._stackwalk_json_analysis(
+                        json_dump,
+                        is_hang,
+                        java_stack_trace,
+                        submitted_timestamp,
+                        processor_notes
+                    )
+                processed_crash_update.update(processed_crash_update_from_json)
+            else if 'status' in json_dump:
+                processor_notes.append("MDSW returned error status: " + json_dump['status'])
+            else:
+                processor_notes.append("MDSW json output missing status")
 
-            try:
-                processed_crash_update.truncated = (
-                    processed_crash_update.json_dump
-                    ['crashing_thread']['frames_truncated']
-                )
-            except KeyError:
-                processed_crash_update.truncated = False
+            processed_crash_update.success = True
 
             mdsw_error_string = processed_crash_update.json_dump.setdefault(
                 'status',
@@ -997,107 +1069,17 @@ class HybridCrashProcessor(RequiredConfig):
         return processed_crash_update
 
     #--------------------------------------------------------------------------
-    def _analyze_header(self, crash_id, dump_analysis_line_iterator,
-                        submitted_timestamp, processor_notes):
-        """ Scan through the lines of the dump header:
-            - extract data to update the record for this crash in 'reports',
-              including the id of the crashing thread
-            Returns: Dictionary of the various values that were updated in
-                     the database
-            Input parameters:
-            - dump_analysis_line_iterator - an iterator object that feeds lines
-                                            from crash dump data
-            - submitted_timestamp
-            - processor_notes
-        """
-        crashed_thread = None
-        processed_crash_update = DotDict()
-        # minimal update requirements
-        processed_crash_update.success = True
-        processed_crash_update.os_name = None
-        processed_crash_update.os_version = None
-        processed_crash_update.cpu_name = None
-        processed_crash_update.cpu_info = None
-        processed_crash_update.reason = None
-        processed_crash_update.address = None
-
-        header_lines_were_found = False
-        flash_version = None
-        for line in dump_analysis_line_iterator:
-            line = line.strip()
-            # empty line separates header data from thread data
-            if line == '' or "====PIPE DUMP ENDS===" in line:
-                break
-            header_lines_were_found = True
-            values = map(lambda x: x.strip(), line.split('|'))
-            if len(values) < 3:
-                processor_notes.append('Bad MDSW header line "%s"'
-                                       % line)
-                continue
-            values = map(emptyFilter, values)
-            if values[0] == 'OS':
-                name = self._truncate_or_none(values[1], 100)
-                version = self._truncate_or_none(values[2], 100)
-                processed_crash_update.os_name = name
-                processed_crash_update.os_version = version
-            elif values[0] == 'CPU':
-                processed_crash_update.cpu_name = \
-                    self._truncate_or_none(values[1], 100)
-                processed_crash_update.cpu_info = \
-                    self._truncate_or_none(values[2], 100)
-                try:
-                    processed_crash_update.cpu_info = ('%s | %s' % (
-                        processed_crash_update.cpu_info,
-                        self._get_truncate_or_none(values, 3, 100)
-                    ))
-                except IndexError:
-                    pass
-            elif values[0] == 'Crash':
-                processed_crash_update.reason = \
-                    self._truncate_or_none(values[1], 255)
-                try:
-                    processed_crash_update.address = \
-                        self._truncate_or_none(values[2], 20)
-                except IndexError:
-                    processed_crash_update.address = None
-                try:
-                    crashed_thread = int(values[3])
-                except Exception:
-                    crashed_thread = None
-            elif values[0] == 'Module':
-                # grab only the flash version, which is not quite as easy as
-                # it looks
-                if not flash_version:
-                    flash_version = self._get_flash_version(values)
-        if not header_lines_were_found:
-            processor_notes.append('MDSW emitted no header lines')
-
-        if crashed_thread is None:
-            processor_notes.append('MDSW did not identify the crashing thread')
-        processed_crash_update.crashedThread = crashed_thread
-        if not flash_version:
-            flash_version = '[blank]'
-        processed_crash_update.flash_version = flash_version
-        return processed_crash_update
-
-    #--------------------------------------------------------------------------
     flash_re = re.compile(r'NPSWF32_?(.*)\.dll|'
                           'FlashPlayerPlugin_?(.*)\.exe|'
                           'libflashplayer(.*)\.(.*)|'
                           'Flash ?Player-?(.*)')
 
     #--------------------------------------------------------------------------
-    def _get_flash_version(self, moduleData):
+    def _get_flash_version(self, module):
         """If (we recognize this module as Flash and figure out a version):
         Returns version; else (None or '')"""
         try:
-            module, filename, version, debug_filename, debug_id = \
-                moduleData[:5]
-        except ValueError:
-            self.config.logger.debug("bad module line %s", moduleData)
-            return None
-        try:
-            m = self.flash_re.match(filename)
+            m = self.flash_re.match(module['filename'])
         except TypeError, x:
             self.config.logger.debug(
                 "bad module line %s, bad filename in second field (%s)",
@@ -1126,43 +1108,24 @@ class HybridCrashProcessor(RequiredConfig):
         return version
 
     #--------------------------------------------------------------------------
-    @staticmethod
-    def _decompose_frame_line(line, processor_notes):
-        decomposed = [emptyFilter(x) for x in line.split('|')]
-        if len(decomposed) == 7:
-            return decomposed
-        else:
-            processor_notes.append(
-                'Bad frame line detected - wrong number of fields (%s...)'
-                % line[:5]
-            )
-            decomposed.extend([None] * 7)
-            return decomposed[:7]
-
-    #--------------------------------------------------------------------------
-    def _analyze_frames(self, hang_type, java_stack_trace,
+    def _analyze_frames(self, frames, hang_type, java_stack_trace,
                         make_modules_lower_case,
-                        dump_analysis_line_iterator, submitted_timestamp,
                         crashed_thread,
+                        submitted_timestamp,
                         processor_notes):
-        """ After the header information, the dump file consists of just frame
-        information.  This function cycles through the frame information
-        looking for frames associated with the crashed thread (determined in
-        analyzeHeader).  Each frame from that thread is written to the database
-        until it has found a maximum of ten frames.
+        """ This function cycles through the frame information of the crashing
+        thread.
 
                returns:
                  a dictionary will various values to be used to update report
                  in the database, including:
-                   truncated - boolean: True - due to excessive length the
-                                               frames of the crashing thread
-                                               may have been truncated.
                    signature - string: an overall signature calculated for this
                                        crash
                    processor_notes - string: any errors or warnings that
                                              happened during the processing
 
                input parameters:
+                 frames - a list of frames in the crashing thread
                  hang_type -  0: if this is not a hang
                             -1: if "HangID" present in json,
                                    but "Hang" was not present
@@ -1171,103 +1134,34 @@ class HybridCrashProcessor(RequiredConfig):
                                     information
                  make_modules_lower_case - boolean, should modules be forced to
                                     lower case for signature generation?
-                 dump_analysis_line_iterator - an iterator that cycles through
-                                            lines from the crash dump
+                 crashed_thread - the number of the thread that crashed
                  submitted_timestamp
-                 crashed_thread - the number of the thread that crashed - we
-                                 want frames only from the crashed thread
                  processor_notes
         """
         #logger.info("analyzeFrames")
-        frame_counter = 0
-        crashing_thread_found = False
-        is_truncated = False
-        frame_lines_were_found = False
         signature_generation_frames = []
         topmost_sourcefiles = []
-        if hang_type == 1:
-            thread_for_signature = 0
-        else:
-            thread_for_signature = crashed_thread
         max_topmost_sourcefiles = 1  # Bug 519703 calls for just one.
                                      # Lets build in some flex
-        # this loop cycles through the pDump frames looking for the crashed
-        # thread so that it can generate a signature.  Once it finds that
-        # data, it spools out the rest of the pDump frames section ignoring the
-        # contents.
-        for line in dump_analysis_line_iterator:
-            # the hybrid stackwalker outputs both pDump and jDump forms
-            # this is the sentinel between them indicating the end of the pDump
-            if '====PIPE DUMP ENDS===' in line:
-                break  # there is more data coming move on to the next stage
-            if line.startswith('{'):
-                break  # we've gone too far and found the jDump - skip ahead
-            if crashing_thread_found:
-                # there's no need to examine the thread frames as we've already
-                # found the frames needed to generate a signature.  Just spool
-                # through the remaining frame lines.
-                continue
-            frame_lines_were_found = True
-            line = line.strip()
-            if line == '':
-                continue  # ignore unexpected blank lines
-
-            (
-                thread_num,
-                frame_num,
-                module_name,
-                function,
-                source,
-                source_line,
-                instruction
-            ) = self._decompose_frame_line(line, processor_notes)
-
-            if len(topmost_sourcefiles) < max_topmost_sourcefiles and source:
-                topmost_sourcefiles.append(source)
-            try:
-                thread_number_as_int = int(thread_num)
-            except ValueError:
-                error_str = (
-                    'thread_num is not an int while reading frames (%s...)'
-                    % line[:5]
+        for frame in frames:
+            if (len(topmost_sourcefiles) < max_topmost_sourcefiles and
+                'file' in frame
+            ):
+                topmost_sourcefiles.append(frame['file'])
+            this_frame_signature = \
+                self.c_signature_tool.normalize_signature(
+                    **frame,
+                    make_modules_lower_case=make_modules_lower_case
                 )
-                processor_notes.append(error_str)
-                continue  # abandon this line, it is seriously defective
-            if thread_for_signature == thread_number_as_int:
-                if make_modules_lower_case:
-                    try:
-                        module_name = module_name.lower()
-                    except AttributeError:
-                        pass
-                this_frame_signature = \
-                    self.c_signature_tool.normalize_signature(
-                        module_name,
-                        function,
-                        source,
-                        source_line,
-                        instruction
-                    )
-                signature_generation_frames.append(this_frame_signature)
-                frame_counter += 1
-            elif frame_counter:
-                # we've found the crashing thread, there is no need to
-                # continue reading the pDump output
-                # this boolean will force the loop to just consume the rest
-                # of the pipe dump with no more processing.
-                crashing_thread_found = True
-        dump_analysis_line_iterator.stopUsingSecondaryCache()
+            signature_generation_frames.append(this_frame_signature)
 
         signature = self._generate_signature(signature_generation_frames,
                                              java_stack_trace,
                                              hang_type,
                                              crashed_thread,
                                              processor_notes)
-        if not frame_lines_were_found:
-            processor_notes.append("MDSW emitted no frames")
         return DotDict({
             "signature": signature,
-            "truncated": is_truncated,   # this is a lie - we won't actually
-                                         # know until jDump is processed
             "topmost_filenames": topmost_sourcefiles,
         })
 
@@ -1399,6 +1293,25 @@ class HybridCrashProcessor(RequiredConfig):
             return a_mapping[key][:maxLength]
         except (KeyError, AttributeError, IndexError, TypeError):
             return None
+
+    #--------------------------------------------------------------------------
+    @staticmethod
+    def _get_recursive_or_default(a_mapping, keys, default=None):
+        current = a_mapping
+        for key in keys:
+            try:
+                current = current[key]
+            except (KeyError, AttributeError, IndexError, TypeError):
+                return default
+        return current
+
+    #--------------------------------------------------------------------------
+    @staticmethod
+    def _get_recursive_truncate_or_none(a_mapping, keys, maxLength=10000):
+        value = _get_recursive_or_default(a_mapping, keys, default=None)
+        if value is None:
+            return value
+        return value[:maxLength]
 
     #--------------------------------------------------------------------------
     @staticmethod

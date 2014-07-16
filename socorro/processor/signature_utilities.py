@@ -94,6 +94,7 @@ class CSignatureToolBase(SignatureTool):
         module_offset=None,
         function_offset=None,
         normalized=None,
+        make_modules_lower_case=False
         **kwargs  # eat any extra kwargs passed in
     ):
         """ returns a structured conglomeration of the input parameters to
@@ -126,6 +127,8 @@ class CSignatureToolBase(SignatureTool):
             return '%s#%s' % (file, line)
         if not module:
             module = ''  # might have been None
+        else if make_modules_lower_case:
+            module = module.lower()
         return '%s@%s' % (module, offset)
 
     #--------------------------------------------------------------------------
